@@ -2,134 +2,266 @@
 pragma solidity ^0.8.28;
 
 contract Prorosca {
-    struct Circle {
+    struct Bid {
+        address bidder;
+        uint256 amount;
+        uint256 timestamp;
+    }
+
+    struct Sail {
         string name;
-        uint256 contributionAmount;
-        uint256 totalParticipants;
+        uint256 monthlyPrincipal;
+        uint256 totalCrewmates;
         uint256 durationInDays;
-        address[] participants;
-        bool isActive;
+        address[] crewmates;
+        address captain;
+        bool isSailing;
         uint256 startTime;
         uint256 nextPayoutTime;
         uint256 currentRound;
+        Bid highestBid;
+        mapping(address => bool) hasContributed;
+        mapping(uint256 => address) roundWinners;
+        mapping(address => uint256) contributions;
     }
 
-    mapping(uint256 => Circle) public circles;
-    uint256 public circleCount;
-    mapping(uint256 => mapping(address => bool)) public hasContributed;
-    mapping(uint256 => mapping(uint256 => address)) public roundWinners;
+    mapping(uint256 => Sail) public sails;
+    uint256 public sailCount;
 
-    event CircleCreated(uint256 indexed circleId, string name, uint256 contributionAmount);
-    event ContributionMade(uint256 indexed circleId, address indexed contributor);
-    event WinnerSelected(uint256 indexed circleId, uint256 indexed round, address winner);
+    event SailLaunched(
+        uint256 indexed sailId,
+        string name,
+        address captain,
+        uint256 monthlyPrincipal
+    );
+    event CrewmateJoined(uint256 indexed sailId, address indexed crewmate);
+    event BidPlaced(
+        uint256 indexed sailId,
+        address indexed bidder,
+        uint256 amount
+    );
+    event RoundCompleted(
+        uint256 indexed sailId,
+        uint256 indexed round,
+        address winner,
+        uint256 amount
+    );
+    event SailAbandoned(uint256 indexed sailId, address captain);
 
-    function createCircle(
+    modifier onlyCaptain(uint256 sailId) {
+        require(
+            msg.sender == sails[sailId].captain,
+            "Only the captain can call this"
+        );
+        _;
+    }
+
+    modifier onlyCrewmate(uint256 sailId) {
+        bool isCrewmate = false;
+        for (uint256 i = 0; i < sails[sailId].crewmates.length; i++) {
+            if (sails[sailId].crewmates[i] == msg.sender) {
+                isCrewmate = true;
+                break;
+            }
+        }
+        require(isCrewmate, "Only crewmates can call this");
+        _;
+    }
+
+    function launchSail(
         string memory name,
-        uint256 contributionAmount,
-        uint256 totalParticipants,
+        uint256 monthlyPrincipal,
+        uint256 totalCrewmates,
         uint256 durationInDays
     ) public returns (uint256) {
-        require(totalParticipants > 1, "Need at least 2 participants");
+        require(totalCrewmates > 1, "Need at least 2 crewmates");
         require(durationInDays > 0, "Duration must be positive");
-        require(contributionAmount > 0, "Contribution must be positive");
+        require(monthlyPrincipal > 0, "Principal must be positive");
 
-        uint256 circleId = circleCount++;
-        Circle storage circle = circles[circleId];
-        
-        circle.name = name;
-        circle.contributionAmount = contributionAmount;
-        circle.totalParticipants = totalParticipants;
-        circle.durationInDays = durationInDays;
-        circle.isActive = true;
-        circle.startTime = block.timestamp;
-        circle.nextPayoutTime = block.timestamp + (durationInDays * 1 days);
-        circle.currentRound = 0;
+        uint256 sailId = sailCount++;
+        Sail storage sail = sails[sailId];
 
-        emit CircleCreated(circleId, name, contributionAmount);
-        return circleId;
+        sail.name = name;
+        sail.monthlyPrincipal = monthlyPrincipal;
+        sail.totalCrewmates = totalCrewmates;
+        sail.durationInDays = durationInDays;
+        sail.captain = msg.sender;
+        sail.isSailing = true;
+        sail.startTime = block.timestamp;
+        sail.nextPayoutTime = block.timestamp + (durationInDays * 1 days);
+        sail.currentRound = 0;
+
+        // Captain is the first crewmate
+        sail.crewmates.push(msg.sender);
+
+        emit SailLaunched(sailId, name, msg.sender, monthlyPrincipal);
+        return sailId;
     }
 
-    function contribute(uint256 circleId) public payable {
-        Circle storage circle = circles[circleId];
-        require(circle.isActive, "Circle is not active");
-        require(msg.value == circle.contributionAmount, "Incorrect contribution amount");
-        require(!hasContributed[circleId][msg.sender], "Already contributed this round");
-        require(circle.participants.length < circle.totalParticipants, "Circle is full");
+    function joinSail(uint256 sailId) public payable {
+        Sail storage sail = sails[sailId];
+        require(sail.isSailing, "This sail is not active");
+        require(
+            msg.value == sail.monthlyPrincipal,
+            "Must contribute monthly principal"
+        );
+        require(
+            sail.crewmates.length < sail.totalCrewmates,
+            "Crew is already full"
+        );
 
-        circle.participants.push(msg.sender);
-        hasContributed[circleId][msg.sender] = true;
-
-        emit ContributionMade(circleId, msg.sender);
-
-        if (circle.participants.length == circle.totalParticipants) {
-            selectWinner(circleId);
+        // Check if already a crewmate
+        for (uint256 i = 0; i < sail.crewmates.length; i++) {
+            require(
+                sail.crewmates[i] != msg.sender,
+                "Already part of the crew"
+            );
         }
+
+        sail.crewmates.push(msg.sender);
+        sail.contributions[msg.sender] = msg.value;
+        emit CrewmateJoined(sailId, msg.sender);
     }
 
-    function selectWinner(uint256 circleId) internal {
-        Circle storage circle = circles[circleId];
-        require(circle.isActive, "Circle is not active");
-        require(circle.participants.length == circle.totalParticipants, "Not enough participants");
+    function placeBid(uint256 sailId, uint256 bidAmount) public onlyCrewmate(sailId) {
+        Sail storage sail = sails[sailId];
+        require(sail.isSailing, "This sail is not active");
+        require(
+            block.timestamp < sail.nextPayoutTime,
+            "Bidding period has ended"
+        );
+        require(
+            bidAmount > sail.highestBid.amount,
+            "Bid must be higher than current highest"
+        );
+        require(
+            sail.contributions[msg.sender] >= sail.monthlyPrincipal,
+            "Must contribute monthly principal first"
+        );
 
-        // Simple random selection for demo purposes
-        // In production, use a more secure randomness source
-        uint256 winnerIndex = uint256(keccak256(abi.encodePacked(
-            block.timestamp,
-            block.prevrandao,
-            circle.currentRound
-        ))) % circle.participants.length;
+        sail.highestBid = Bid({
+            bidder: msg.sender,
+            amount: bidAmount,
+            timestamp: block.timestamp
+        });
 
-        address winner = circle.participants[winnerIndex];
-        roundWinners[circleId][circle.currentRound] = winner;
+        emit BidPlaced(sailId, msg.sender, bidAmount);
+    }
 
+    function completeRound(uint256 sailId) public {
+        Sail storage sail = sails[sailId];
+        require(sail.isSailing, "This sail is not active");
+        require(
+            block.timestamp >= sail.nextPayoutTime,
+            "Round is not over yet"
+        );
+        require(
+            sail.crewmates.length == sail.totalCrewmates,
+            "Crew not full yet"
+        );
+
+        address winner = sail.highestBid.bidder;
+        uint256 payout = sail.monthlyPrincipal * sail.totalCrewmates;
+
+        // Record winner and reset for next round
+        sail.roundWinners[sail.currentRound] = winner;
+        
         // Transfer the pool to the winner
-        uint256 poolAmount = circle.contributionAmount * circle.totalParticipants;
-        payable(winner).transfer(poolAmount);
+        payable(winner).transfer(payout);
 
-        emit WinnerSelected(circleId, circle.currentRound, winner);
+        emit RoundCompleted(
+            sailId,
+            sail.currentRound,
+            winner,
+            payout
+        );
 
         // Reset for next round
-        delete circle.participants;
-        circle.currentRound++;
-        circle.nextPayoutTime += circle.durationInDays * 1 days;
+        sail.currentRound++;
+        sail.nextPayoutTime += sail.durationInDays * 1 days;
+        sail.highestBid = Bid(address(0), 0, 0);
 
-        // Clear contribution records for all participants
-        for (uint256 i = 0; i < circle.totalParticipants; i++) {
-            hasContributed[circleId][circle.participants[i]] = false;
+        // Reset contributions tracking
+        for (uint256 i = 0; i < sail.crewmates.length; i++) {
+            sail.contributions[sail.crewmates[i]] = 0;
         }
 
         // Check if all rounds are complete
-        if (circle.currentRound >= circle.totalParticipants) {
-            circle.isActive = false;
+        if (sail.currentRound >= sail.totalCrewmates) {
+            sail.isSailing = false;
         }
     }
 
-    function getCircleInfo(uint256 circleId) public view returns (
-        string memory name,
-        uint256 contributionAmount,
-        uint256 totalParticipants,
-        uint256 durationInDays,
-        bool isActive,
-        uint256 startTime,
-        uint256 nextPayoutTime,
-        uint256 currentRound,
-        uint256 currentParticipants
-    ) {
-        Circle storage circle = circles[circleId];
+    function abandonShip(uint256 sailId) public onlyCaptain(sailId) {
+        Sail storage sail = sails[sailId];
+        require(sail.isSailing, "This sail is not active");
+        
+        // Return remaining funds to crewmates
+        for (uint256 i = 0; i < sail.crewmates.length; i++) {
+            address crewmate = sail.crewmates[i];
+            uint256 contribution = sail.contributions[crewmate];
+            if (contribution > 0) {
+                payable(crewmate).transfer(contribution);
+            }
+        }
+
+        sail.isSailing = false;
+        emit SailAbandoned(sailId, msg.sender);
+    }
+
+    // View functions
+    function getSailInfo(uint256 sailId)
+        public
+        view
+        returns (
+            string memory name,
+            uint256 monthlyPrincipal,
+            uint256 totalCrewmates,
+            uint256 durationInDays,
+            bool isSailing,
+            uint256 startTime,
+            uint256 nextPayoutTime,
+            uint256 currentRound,
+            uint256 currentCrewmates,
+            address captain,
+            address highestBidder,
+            uint256 highestBid
+        )
+    {
+        Sail storage sail = sails[sailId];
         return (
-            circle.name,
-            circle.contributionAmount,
-            circle.totalParticipants,
-            circle.durationInDays,
-            circle.isActive,
-            circle.startTime,
-            circle.nextPayoutTime,
-            circle.currentRound,
-            circle.participants.length
+            sail.name,
+            sail.monthlyPrincipal,
+            sail.totalCrewmates,
+            sail.durationInDays,
+            sail.isSailing,
+            sail.startTime,
+            sail.nextPayoutTime,
+            sail.currentRound,
+            sail.crewmates.length,
+            sail.captain,
+            sail.highestBid.bidder,
+            sail.highestBid.amount
         );
     }
 
-    function getParticipants(uint256 circleId) public view returns (address[] memory) {
-        return circles[circleId].participants;
+    function getCrewmates(uint256 sailId) public view returns (address[] memory) {
+        return sails[sailId].crewmates;
+    }
+
+    function getRoundWinner(uint256 sailId, uint256 round)
+        public
+        view
+        returns (address)
+    {
+        return sails[sailId].roundWinners[round];
+    }
+
+    function getContribution(uint256 sailId, address crewmate)
+        public
+        view
+        returns (uint256)
+    {
+        return sails[sailId].contributions[crewmate];
     }
 } 
